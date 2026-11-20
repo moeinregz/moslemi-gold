@@ -1,0 +1,14 @@
+{
+  "platform": "node",
+  "app": "moslemi-gold",
+  "port": 4000,
+  "node": {
+    "version": "22"
+  },
+  "disks": [
+    {
+      "name": "data",
+      "mountTo": "data"
+    }
+  ]
+}
