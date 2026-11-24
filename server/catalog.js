@@ -1,13 +1,13 @@
-import { db } from "./db.js";
+import { many, one } from "./db.js";
 import { getSettings } from "./settings.js";
 import { priceProduct } from "./pricing.js";
 import { siteUrl } from "./config.js";
 
 export const imageUrl = (filename) => `/uploads/${filename}`;
 
-function imagesFor(ids) {
+async function imagesFor(ids) {
   if (!ids.length) return new Map();
-  const rows = db().prepare(`SELECT id, product_id, filename FROM product_images WHERE product_id IN (${ids.map(() => "?").join(",")}) ORDER BY sort, id`).all(...ids);
+  const rows = await many("image", { product_id: { $in: ids } }, { sort: { sort: 1, id: 1 } });
   const m = new Map();
   for (const r of rows) {
     if (!m.has(r.product_id)) m.set(r.product_id, []);
@@ -16,9 +16,17 @@ function imagesFor(ids) {
   return m;
 }
 
+/** نام و نامک دسته را به هر محصول اضافه می‌کند (معادل LEFT JOIN) */
+export async function withCategory(rows) {
+  const ids = [...new Set(rows.map((r) => r.category_id).filter((x) => x != null))];
+  const cats = new Map((ids.length ? await many("category", { id: { $in: ids } }) : []).map((c) => [c.id, c]));
+  return rows.map((p) => ({ ...p, category_name: cats.get(p.category_id)?.name ?? null, category_slug: cats.get(p.category_id)?.slug ?? null }));
+}
+
 /** محصول + قیمت روز + عکس‌ها برای نمایش عمومی */
-export function present(rows, s = getSettings()) {
-  const imgs = imagesFor(rows.map((r) => r.id));
+export async function present(rows, s) {
+  s ??= await getSettings();
+  const imgs = await imagesFor(rows.map((r) => r.id));
   return rows.map((p) => {
     const pr = priceProduct(p, s);
     let specs = [];
@@ -39,43 +47,52 @@ export function present(rows, s = getSettings()) {
   });
 }
 
-const BASE = `SELECT p.*, c.name category_name, c.slug category_slug FROM products p LEFT JOIN categories c ON c.id = p.category_id`;
+const SORTERS = {
+  popular: (a, b) => b.sold_count - a.sold_count || b.id - a.id,
+  weight: (a, b) => b.weight - a.weight || b.id - a.id,
+  default: (a, b) => (b.stock > 0) - (a.stock > 0) || b.featured - a.featured || b.id - a.id,
+};
 
-export function listPublic({ category, q, sort, featured, limit = 60, offset = 0 } = {}) {
-  const where = ["p.active = 1", "(c.id IS NULL OR c.active = 1)"];
-  const args = [];
-  if (category) {
-    where.push("c.slug = ?");
-    args.push(category);
-  }
+export async function listPublic({ category, q, sort, featured, limit = 60, offset = 0 } = {}) {
+  const filter = { active: 1 };
+  if (featured) filter.featured = 1;
   if (q) {
-    where.push("(p.title LIKE ? OR p.short_desc LIKE ? OR p.sku LIKE ?)");
-    args.push(`%${q}%`, `%${q}%`, `%${q}%`);
+    const rx = new RegExp(String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    filter.$or = [{ title: rx }, { short_desc: rx }, { sku: rx }];
   }
-  if (featured) where.push("p.featured = 1");
-  const order = sort === "popular" ? "p.sold_count DESC" : sort === "weight" ? "p.weight DESC" : "p.stock > 0 DESC, p.featured DESC, p.id DESC";
-  const rows = db().prepare(`${BASE} WHERE ${where.join(" AND ")} ORDER BY ${order} LIMIT ? OFFSET ?`).all(...args, limit, offset);
-  let items = present(rows);
-  if (sort === "cheap") items.sort((a, b) => a.price - b.price);
-  if (sort === "expensive") items.sort((a, b) => b.price - a.price);
-  return items;
+  const cats = await many("category");
+  const byId = new Map(cats.map((c) => [c.id, c]));
+  if (category) {
+    const c = cats.find((x) => x.slug === category && x.active);
+    if (!c) return [];
+    filter.category_id = c.id;
+  }
+  // محصولِ دسته‌ی غیرفعال نمایش داده نمی‌شه (محصول بدون دسته نمایش داده می‌شه)
+  let rows = (await many("product", filter)).filter((p) => p.category_id == null || byId.get(p.category_id)?.active);
+  const price = sort === "cheap" || sort === "expensive";
+  if (!price) rows.sort(SORTERS[sort] || SORTERS.default);
+  rows = rows.map((p) => ({ ...p, category_name: byId.get(p.category_id)?.name ?? null, category_slug: byId.get(p.category_id)?.slug ?? null }));
+  if (!price) return present(rows.slice(offset, offset + limit));
+  const items = await present(rows);
+  items.sort(sort === "cheap" ? (a, b) => a.price - b.price : (a, b) => b.price - a.price);
+  return items.slice(offset, offset + limit);
 }
 
-export function getPublic(slug) {
-  const row = db().prepare(`${BASE} WHERE p.slug = ? AND p.active = 1`).get(slug);
-  return row ? present([row])[0] : null;
+export async function getPublic(slug) {
+  const row = await one("product", { slug, active: 1 });
+  return row ? (await present(await withCategory([row])))[0] : null;
 }
 
-export function getById(id) {
-  const row = db().prepare(`${BASE} WHERE p.id = ?`).get(id);
-  return row ? present([row])[0] : null;
+export async function getById(id) {
+  const row = await one("product", { id: Number(id) });
+  return row ? (await present(await withCategory([row])))[0] : null;
 }
 
 /** همه‌ی محصولات فعال برای فیدها (ترب، ایمالز، گوگل) */
-export function feedProducts() {
-  const rows = db().prepare(`${BASE} WHERE p.active = 1 ORDER BY p.id`).all();
+export async function feedProducts() {
+  const rows = await many("product", { active: 1 }, { sort: { id: 1 } });
   const base = siteUrl();
-  return present(rows).map((p) => ({ ...p, url: `${base}/product/${encodeURIComponent(p.slug)}`, image_links: p.images.map((i) => base + i.url) }));
+  return (await present(await withCategory(rows))).map((p) => ({ ...p, url: `${base}/product/${encodeURIComponent(p.slug)}`, image_links: p.images.map((i) => base + i.url) }));
 }
 
 export function slugify(s) {

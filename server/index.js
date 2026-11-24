@@ -2,14 +2,23 @@ import express from "express";
 import fs from "node:fs";
 import path from "node:path";
 import { ROOT, PORT, IS_PROD, siteUrl } from "./config.js";
-import { db, UPLOAD_DIR } from "./db.js";
+import { initDb, ping, UPLOAD_DIR } from "./db.js";
 import { getSettings } from "./settings.js";
 import { getPublic } from "./catalog.js";
 import publicApi from "./routes/public.js";
 import adminApi from "./routes/admin.js";
 import feeds from "./channels/feeds.js";
 
-db(); // ساخت/مهاجرت دیتابیس هنگام شروع
+const isMain = !!process.argv[1] && path.resolve(process.argv[1]) === path.join(ROOT, "server", "index.js");
+try {
+  await initDb(); // اتصال به MongoDB Atlas، ساخت ایندکس‌ها و داده‌ی اولیه
+  console.log("✓ MongoDB Atlas وصل شد");
+} catch (e) {
+  console.error("✗ اتصال به MongoDB برقرار نشد:", e.message);
+  console.error("  بررسی کنید: ۱) مقادیر MONGODB_* در .env  ۲) در Atlas بخش Network Access آی‌پی سرور مجاز باشد  ۳) نام کاربری/رمز درست باشد");
+  if (isMain) process.exit(1);
+  throw e;
+}
 
 export const app = express();
 app.disable("x-powered-by");
@@ -32,6 +41,15 @@ app.use("/api", (req, res, next) => {
   next();
 });
 
+app.get("/api/health", async (req, res) => {
+  try {
+    await ping();
+    res.json({ ok: true });
+  } catch {
+    res.status(503).json({ ok: false });
+  }
+});
+
 app.use("/uploads", express.static(UPLOAD_DIR, { maxAge: "30d", immutable: true, fallthrough: false }));
 app.use("/api/admin", (req, res, next) => {
   res.setHeader("Cache-Control", "no-store");
@@ -49,12 +67,12 @@ const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").
  * متاتگ‌ها سمت سرور به HTML اضافه می‌شن تا ترب، گوگل و شبکه‌های اجتماعی بدون اجرای جاوااسکریپت
  * عنوان، قیمت و موجودی هر محصول رو ببینن.
  */
-function headFor(req) {
-  const s = getSettings();
+async function headFor(req) {
+  const s = await getSettings();
   const base = siteUrl();
   const m = req.path.match(/^\/product\/([^/]+)\/?$/);
   if (m) {
-    const p = getPublic(decodeURIComponent(m[1]));
+    const p = await getPublic(decodeURIComponent(m[1]));
     if (p) {
       const url = `${base}/product/${encodeURIComponent(p.slug)}`;
       const img = p.images[0] ? base + p.images[0].url : "";
@@ -96,11 +114,15 @@ if (IS_PROD || fs.existsSync(path.join(DIST, "index.html"))) {
   };
   app.use("/assets", express.static(path.join(DIST, "assets"), { maxAge: "1y", immutable: true, fallthrough: false }));
   app.use(express.static(DIST, { index: false, maxAge: "1d" }));
-  app.get("*", (req, res) => {
-    res.setHeader("Cache-Control", "no-cache");
-    const html = template();
-    const { status, head } = headFor(req);
-    res.status(status).type("html").send(html.replace("<!--app-head-->", head));
+  app.get("*", async (req, res, next) => {
+    try {
+      res.setHeader("Cache-Control", "no-cache");
+      const html = template();
+      const { status, head } = await headFor(req);
+      res.status(status).type("html").send(html.replace("<!--app-head-->", head));
+    } catch (e) {
+      next(e);
+    }
   });
 } else {
   app.get("/", (req, res) => res.send("API در حال اجراست. برای رابط کاربری: npm run dev (پورت 5173) یا npm run build."));
@@ -112,6 +134,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "خطای داخلی سرور" });
 });
 
-if (process.argv[1] && path.resolve(process.argv[1]) === path.join(ROOT, "server", "index.js")) {
-  app.listen(PORT, () => console.log(`✓ ${getSettings().store_name} روی http://localhost:${PORT}  (SITE_URL=${siteUrl()})`));
+if (isMain) {
+  const name = (await getSettings()).store_name;
+  app.listen(PORT, () => console.log(`✓ ${name} روی http://localhost:${PORT}  (SITE_URL=${siteUrl()})`));
 }

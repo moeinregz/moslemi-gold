@@ -3,11 +3,11 @@ import multer from "multer";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { db, now, tx, UPLOAD_DIR } from "../db.js";
+import { raw, one, many, count, insert, update, updateMany, remove, removeMany, like, now, UPLOAD_DIR } from "../db.js";
 import { getSettings, setSettings, DEFAULTS, num } from "../settings.js";
 import { priceProduct, tickerItems } from "../pricing.js";
-import { getById, slugify, imageUrl } from "../catalog.js";
-import { getOrder, changeStatus, STATUSES, OrderError, expireStale } from "../orders.js";
+import { withCategory, slugify, imageUrl } from "../catalog.js";
+import { getOrder, changeStatus, STATUSES, PAID_STATUSES, OrderError, expireStale } from "../orders.js";
 import { gateway, GATEWAYS } from "../payments/index.js";
 import { siteUrl } from "../config.js";
 import { hashPassword, verifyPassword, PERMISSIONS, ROLES, tooManyAttempts, recordFail, clearFails } from "../auth.js";
@@ -26,127 +26,160 @@ const wrap = (fn) => (req, res) =>
   Promise.resolve().then(() => fn(req, res)).catch((e) => {
     if (e instanceof HttpError) return res.status(e.status).json({ error: e.message, ...e.extra });
     if (e instanceof OrderError) return res.status(400).json({ error: e.message });
-    if (String(e.message).includes("UNIQUE constraint failed")) return res.status(400).json({ error: "این مقدار (نامک/نام کاربری) تکراری است." });
+    if (e?.code === 11000) return res.status(400).json({ error: "این مقدار (نامک/نام کاربری) تکراری است." });
     console.error(e);
     res.status(500).json({ error: "خطای داخلی سرور" });
   });
 const str = (v, max = 500) => String(v ?? "").trim().slice(0, max);
 const bool = (v) => (v === true || v === 1 || v === "1" || v === "true" ? 1 : 0);
+const NOCASE = { locale: "en", strength: 2 };
+
+/**
+ * ذخیره با قفل خوش‌بینانه: اگه کاربر دیگه‌ای هم‌زمان همین سند رو ذخیره کرده باشه، نسخه‌ها فرق می‌کنن
+ * و به‌جای پاک کردن تغییرات اون، خطای ۴۰۹ برمی‌گرده. شرط نسخه داخل خود دستور نوشتن است (اتمیک).
+ */
+async function saveVersioned(t, id, version, label, set) {
+  const filter = { t, id };
+  if (version !== undefined) filter.version = Number(version);
+  const res = await raw().updateOne(filter, { $set: set, $inc: { version: 1 } });
+  if (res.matchedCount) return;
+  const row = await one(t, { id }, { projection: { updated_by: 1 } });
+  if (!row) throw new HttpError(404, `${label} پیدا نشد.`);
+  throw new HttpError(409, `${label} همین الان توسط ${row.updated_by || "کاربر دیگری"} تغییر کرده. صفحه را تازه کنید تا آخرین نسخه را ببینید.`, { conflict: true });
+}
 
 // ======================= ورود =======================
-r.post("/login", wrap((req, res) => {
+r.post("/login", wrap(async (req, res) => {
   const username = str(req.body.username, 60);
   const key = `a:${req.ip}:${username.toLowerCase()}`;
   if (tooManyAttempts(key)) throw new HttpError(429, "تلاش‌های ناموفق زیاد بود؛ ۱۵ دقیقه دیگر امتحان کنید.");
-  const u = db().prepare("SELECT * FROM users WHERE username=?").get(username);
+  const u = await one("user", { username }, { collation: NOCASE });
   if (!u || !verifyPassword(req.body.password, u.password_hash)) {
     recordFail(key);
     throw new HttpError(400, "نام کاربری یا رمز عبور اشتباه است.");
   }
   if (!u.active) throw new HttpError(403, "حساب شما غیرفعال شده است.");
   clearFails(key);
-  createSession(req, res, "admin", u.id);
-  db().prepare("UPDATE users SET last_login=? WHERE id=?").run(now(), u.id);
+  await createSession(req, res, "admin", u.id);
+  await update("user", { id: u.id }, { $set: { last_login: now() } });
   req.admin = u;
-  log(req, "ورود به پنل");
+  await log(req, "ورود به پنل");
   res.json({ ok: true });
 }));
 
-r.post("/logout", (req, res) => {
-  destroySession(req, res, "admin");
+r.post("/logout", wrap(async (req, res) => {
+  await destroySession(req, res, "admin");
   res.json({ ok: true });
-});
+}));
 
-r.get("/me", (req, res) => {
-  const u = currentAdmin(req);
+r.get("/me", wrap(async (req, res) => {
+  const u = await currentAdmin(req);
   if (!u) return res.status(401).json({ error: "وارد نشده‌اید." });
   const { token, perms, ...me } = u;
   res.json({ me, roles: ROLES, permissions: PERMISSIONS, statuses: STATUSES, site_url: siteUrl() });
-});
+}));
 
-r.put("/me/password", requireAdmin(), wrap((req, res) => {
-  const u = db().prepare("SELECT * FROM users WHERE id=?").get(req.admin.id);
+r.put("/me/password", requireAdmin(), wrap(async (req, res) => {
+  const u = await one("user", { id: req.admin.id });
   if (!verifyPassword(req.body.current_password, u.password_hash)) throw new HttpError(400, "رمز فعلی اشتباه است.");
   if (str(req.body.new_password).length < 8) throw new HttpError(400, "رمز جدید حداقل ۸ کاراکتر باشد.");
-  db().prepare("UPDATE users SET password_hash=? WHERE id=?").run(hashPassword(req.body.new_password), u.id);
-  killSessions("admin", u.id, req.admin.token);
-  log(req, "تغییر رمز خود");
+  await update("user", { id: u.id }, { $set: { password_hash: hashPassword(req.body.new_password) } });
+  await killSessions("admin", u.id, req.admin.token);
+  await log(req, "تغییر رمز خود");
   res.json({ ok: true });
 }));
 
 // ======================= داشبورد =======================
-r.get("/dashboard", requireAdmin("dashboard"), (req, res) => {
-  expireStale();
-  const d = db();
-  const PAID = "('paid','processing','shipped','ready_pickup','delivered')";
+r.get("/dashboard", requireAdmin("dashboard"), wrap(async (req, res) => {
+  await expireStale();
   const today = new Date(Date.now() - 86400_000).toISOString();
   const month = new Date(Date.now() - 30 * 86400_000).toISOString();
-  const sum = (since) => d.prepare(`SELECT COUNT(*) c, COALESCE(SUM(total),0) s FROM orders WHERE status IN ${PAID} AND paid_at >= ?`).get(since);
-  const days = d.prepare(`SELECT substr(paid_at,1,10) day, COUNT(*) c, SUM(total) s FROM orders WHERE status IN ${PAID} AND paid_at >= ? GROUP BY day ORDER BY day`).all(new Date(Date.now() - 14 * 86400_000).toISOString());
+  const fortnight = new Date(Date.now() - 14 * 86400_000).toISOString();
+  const paid = await many("order", { status: { $in: PAID_STATUSES }, paid_at: { $gte: month } }, { projection: { total: 1, paid_at: 1 } });
+  const sum = (list) => ({ c: list.length, s: list.reduce((a, o) => a + o.total, 0) });
+  const perDay = new Map();
+  for (const o of paid) {
+    if (o.paid_at < fortnight) continue;
+    const day = o.paid_at.slice(0, 10);
+    const d = perDay.get(day) || { day, c: 0, s: 0 };
+    d.c++;
+    d.s += o.total;
+    perDay.set(day, d);
+  }
+  const [toProcess, allProducts, lowStock, recent, top, sessions] = await Promise.all([
+    count("order", { status: { $in: ["paid", "awaiting_confirmation", "processing"] } }),
+    many("product", {}, { projection: { active: 1 } }),
+    many("product", { active: 1, stock: { $lte: 1 } }, { projection: { id: 1, title: 1, stock: 1 }, sort: { stock: 1 }, limit: 10 }),
+    many("order", {}, { projection: { code: 1, name: 1, total: 1, status: 1, created_at: 1 }, sort: { id: -1 }, limit: 8 }),
+    many("product", { sold_count: { $gt: 0 } }, { projection: { id: 1, title: 1, sold_count: 1 }, sort: { sold_count: -1 }, limit: 5 }),
+    many("session", { kind: "admin", last_seen: { $gte: new Date(Date.now() - 15 * 60_000).toISOString() } }, { projection: { subject_id: 1 } }),
+  ]);
+  const onlineUsers = sessions.length ? await many("user", { id: { $in: [...new Set(sessions.map((x) => x.subject_id))] } }, { projection: { name: 1 } }) : [];
+  const s = await getSettings();
   res.json({
-    today: sum(today),
-    month: sum(month),
-    to_process: d.prepare("SELECT COUNT(*) c FROM orders WHERE status IN ('paid','awaiting_confirmation','processing')").get().c,
-    products: d.prepare("SELECT COUNT(*) c, SUM(active) a FROM products").get(),
-    low_stock: d.prepare("SELECT id,title,stock FROM products WHERE active=1 AND stock<=1 ORDER BY stock LIMIT 10").all(),
-    recent: d.prepare("SELECT code,name,total,status,created_at FROM orders ORDER BY id DESC LIMIT 8").all().map((o) => ({ ...o, status_title: STATUSES[o.status] })),
-    top: d.prepare("SELECT id,title,sold_count FROM products WHERE sold_count>0 ORDER BY sold_count DESC LIMIT 5").all(),
-    days,
-    gold_rate: num(getSettings().gold_rate_18),
-    gold_rate_updated_at: getSettings().gold_rate_updated_at,
-    online: d.prepare("SELECT DISTINCT u.name FROM sessions s JOIN users u ON u.id=s.subject_id WHERE s.kind='admin' AND s.last_seen >= ?").all(new Date(Date.now() - 15 * 60_000).toISOString()).map((x) => x.name),
+    today: sum(paid.filter((o) => o.paid_at >= today)),
+    month: sum(paid),
+    to_process: toProcess,
+    products: { c: allProducts.length, a: allProducts.reduce((a, p) => a + (p.active ? 1 : 0), 0) },
+    low_stock: lowStock,
+    recent: recent.map((o) => ({ ...o, status_title: STATUSES[o.status] })),
+    top,
+    days: [...perDay.values()].sort((a, b) => (a.day < b.day ? -1 : 1)),
+    gold_rate: num(s.gold_rate_18),
+    gold_rate_updated_at: s.gold_rate_updated_at,
+    online: [...new Set(onlineUsers.map((u) => u.name))],
   });
-});
+}));
 
 // ======================= نرخ طلا =======================
-r.get("/gold", requireAdmin("gold_rate", "products"), (req, res) => {
-  const s = getSettings();
+r.get("/gold", requireAdmin("gold_rate", "products"), wrap(async (req, res) => {
+  const s = await getSettings();
   res.json({ gold_rate_18: s.gold_rate_18, vat_percent: s.vat_percent, ticker_extra: s.ticker_extra, gold_rate_updated_at: s.gold_rate_updated_at, ticker: tickerItems(s) });
-});
-r.put("/gold", requireAdmin("gold_rate"), wrap((req, res) => {
+}));
+r.put("/gold", requireAdmin("gold_rate"), wrap(async (req, res) => {
   const rate = num(req.body.gold_rate_18);
   if (rate < 100000) throw new HttpError(400, "نرخ هر گرم طلا (تومان) را درست وارد کنید.");
-  const before = getSettings().gold_rate_18;
-  setSettings({ gold_rate_18: Math.round(rate), vat_percent: num(req.body.vat_percent, 10), ticker_extra: str(req.body.ticker_extra, 2000) });
-  log(req, "تغییر نرخ طلا", "settings", "gold_rate_18", `${before} → ${Math.round(rate)}`);
+  const before = (await getSettings()).gold_rate_18;
+  await setSettings({ gold_rate_18: Math.round(rate), vat_percent: num(req.body.vat_percent, 10), ticker_extra: str(req.body.ticker_extra, 2000) });
+  await log(req, "تغییر نرخ طلا", "settings", "gold_rate_18", `${before} → ${Math.round(rate)}`);
   res.json({ ok: true });
 }));
 
 // ======================= محصولات =======================
-const adminProduct = (id) => {
-  const p = db().prepare("SELECT p.*, c.name category_name FROM products p LEFT JOIN categories c ON c.id=p.category_id WHERE p.id=?").get(id);
-  if (!p) return null;
-  p.images = db().prepare("SELECT id, filename FROM product_images WHERE product_id=? ORDER BY sort,id").all(id).map((i) => ({ ...i, url: imageUrl(i.filename) }));
+const adminProduct = async (id) => {
+  const row = await one("product", { id });
+  if (!row) return null;
+  const [p] = await withCategory([row]);
+  p.images = (await many("image", { product_id: id }, { sort: { sort: 1, id: 1 } })).map((i) => ({ id: i.id, filename: i.filename, url: imageUrl(i.filename) }));
   p.specs = JSON.parse(p.specs || "[]");
-  p.pricing = priceProduct(p, getSettings());
+  p.pricing = priceProduct(p, await getSettings());
+  delete p.category_slug;
   return p;
 };
 
-r.get("/products", requireAdmin("products"), (req, res) => {
-  const where = [];
-  const args = [];
-  if (req.query.q) {
-    where.push("(p.title LIKE ? OR p.sku LIKE ?)");
-    args.push(`%${req.query.q}%`, `%${req.query.q}%`);
-  }
-  if (req.query.category) {
-    where.push("p.category_id=?");
-    args.push(Number(req.query.category));
-  }
-  if (req.query.status === "active") where.push("p.active=1");
-  if (req.query.status === "inactive") where.push("p.active=0");
-  if (req.query.status === "out") where.push("p.stock<=0");
-  const rows = db().prepare(`SELECT p.*, c.name category_name, (SELECT filename FROM product_images WHERE product_id=p.id ORDER BY sort,id LIMIT 1) image
-    FROM products p LEFT JOIN categories c ON c.id=p.category_id ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY p.id DESC`).all(...args);
-  const s = getSettings();
-  res.json(rows.map((p) => ({ ...p, specs: undefined, description: undefined, image: p.image ? imageUrl(p.image) : null, price: priceProduct(p, s).price })));
-});
+r.get("/products", requireAdmin("products"), wrap(async (req, res) => {
+  const filter = {};
+  if (req.query.q) filter.$or = [{ title: like(req.query.q) }, { sku: like(req.query.q) }];
+  if (req.query.category) filter.category_id = Number(req.query.category);
+  if (req.query.status === "active") filter.active = 1;
+  if (req.query.status === "inactive") filter.active = 0;
+  if (req.query.status === "out") filter.stock = { $lte: 0 };
+  const rows = await withCategory(await many("product", filter, { sort: { id: -1 } }));
+  const imgs = await many("image", { product_id: { $in: rows.map((p) => p.id) } }, { sort: { sort: 1, id: 1 } });
+  const first = new Map();
+  for (const i of imgs) if (!first.has(i.product_id)) first.set(i.product_id, i.filename);
+  const s = await getSettings();
+  res.json(rows.map((p) => {
+    const { category_slug, ...rest } = p;
+    return { ...rest, specs: undefined, description: undefined, image: first.has(p.id) ? imageUrl(first.get(p.id)) : null, price: priceProduct(p, s).price };
+  }));
+}));
 
-r.get("/products/:id", requireAdmin("products"), (req, res) => {
-  const p = adminProduct(Number(req.params.id));
+r.get("/products/:id", requireAdmin("products"), wrap(async (req, res) => {
+  const p = await adminProduct(Number(req.params.id));
   if (!p) return res.status(404).json({ error: "محصول پیدا نشد." });
   res.json(p);
-});
+}));
 
 function productFields(b) {
   const mode = b.pricing_mode === "fixed" ? "fixed" : "gold";
@@ -177,69 +210,54 @@ function productFields(b) {
   return f;
 }
 
-r.post("/products", requireAdmin("products"), wrap((req, res) => {
+r.post("/products", requireAdmin("products"), wrap(async (req, res) => {
   const f = productFields(req.body);
-  if (db().prepare("SELECT 1 FROM products WHERE slug=?").get(f.slug)) f.slug = `${f.slug}-${crypto.randomInt(100, 999)}`;
+  if (await one("product", { slug: f.slug }, { projection: { id: 1 } })) f.slug = `${f.slug}-${crypto.randomInt(100, 999)}`;
   const t = now();
   const who = req.admin.name;
-  const cols = Object.keys(f);
-  const id = db().prepare(`INSERT INTO products (${cols.join(",")},created_by,updated_by,created_at,updated_at) VALUES (${cols.map(() => "?").join(",")},?,?,?,?)`)
-    .run(...Object.values(f), who, who, t, t).lastInsertRowid;
-  log(req, "افزودن محصول", "product", id, f.title);
-  res.json(adminProduct(id));
+  const id = await insert("product", {
+    ...f, sold_count: 0, version: 1, basalam_id: null, basalam_photo: null, basalam_synced_at: null, basalam_error: null,
+    created_by: who, updated_by: who, created_at: t, updated_at: t,
+  });
+  await log(req, "افزودن محصول", "product", id, f.title);
+  res.json(await adminProduct(id));
 }));
 
-/**
- * ویرایش با قفل خوش‌بینانه: اگه کاربر دیگه‌ای هم‌زمان همین محصول رو ذخیره کرده باشه، نسخه‌ها فرق می‌کنن
- * و به‌جای پاک کردن تغییرات اون، خطای ۴۰۹ برمی‌گرده.
- */
-function checkVersion(table, id, version, label) {
-  const row = db().prepare(`SELECT version, ${table === "products" ? "updated_by" : "'' updated_by"} FROM ${table} WHERE id=?`).get(id);
-  if (!row) throw new HttpError(404, `${label} پیدا نشد.`);
-  if (version !== undefined && Number(version) !== row.version)
-    throw new HttpError(409, `${label} همین الان توسط ${row.updated_by || "کاربر دیگری"} تغییر کرده. صفحه را تازه کنید تا آخرین نسخه را ببینید.`, { conflict: true });
-}
-
-r.put("/products/:id", requireAdmin("products"), wrap((req, res) => {
+r.put("/products/:id", requireAdmin("products"), wrap(async (req, res) => {
   const id = Number(req.params.id);
   const f = productFields(req.body);
-  tx(() => {
-    checkVersion("products", id, req.body.version, "این محصول");
-    const clash = db().prepare("SELECT id FROM products WHERE slug=? AND id!=?").get(f.slug, id);
-    if (clash) throw new HttpError(400, "این نامک (آدرس) برای محصول دیگری استفاده شده.");
-    db().prepare(`UPDATE products SET ${Object.keys(f).map((k) => `${k}=?`).join(",")}, updated_by=?, updated_at=?, version=version+1 WHERE id=?`)
-      .run(...Object.values(f), req.admin.name, now(), id);
-  });
-  log(req, "ویرایش محصول", "product", id, f.title);
-  res.json(adminProduct(id));
+  if (!(await one("product", { id }, { projection: { id: 1 } }))) throw new HttpError(404, "این محصول پیدا نشد.");
+  if (await one("product", { slug: f.slug, id: { $ne: id } }, { projection: { id: 1 } })) throw new HttpError(400, "این نامک (آدرس) برای محصول دیگری استفاده شده.");
+  await saveVersioned("product", id, req.body.version, "این محصول", { ...f, updated_by: req.admin.name, updated_at: now() });
+  await log(req, "ویرایش محصول", "product", id, f.title);
+  res.json(await adminProduct(id));
 }));
 
 /** ویرایش سریع از لیست: موجودی، فعال بودن، ویژه بودن، تخفیف */
-r.patch("/products/:id", requireAdmin("products"), wrap((req, res) => {
+r.patch("/products/:id", requireAdmin("products"), wrap(async (req, res) => {
   const id = Number(req.params.id);
-  const sets = [];
-  const args = [];
-  if ("stock" in req.body) sets.push("stock=?"), args.push(Math.max(0, Math.floor(num(req.body.stock))));
-  if ("active" in req.body) sets.push("active=?"), args.push(bool(req.body.active));
-  if ("featured" in req.body) sets.push("featured=?"), args.push(bool(req.body.featured));
-  if ("discount_percent" in req.body) sets.push("discount_percent=?"), args.push(Math.min(100, Math.max(0, num(req.body.discount_percent))));
-  if (!sets.length) throw new HttpError(400, "چیزی برای تغییر نیست.");
-  tx(() => {
-    checkVersion("products", id, req.body.version, "این محصول");
-    db().prepare(`UPDATE products SET ${sets.join(",")}, updated_by=?, updated_at=?, version=version+1 WHERE id=?`).run(...args, req.admin.name, now(), id);
-  });
-  log(req, "ویرایش سریع محصول", "product", id, req.body);
-  res.json(adminProduct(id));
+  const set = {};
+  if ("stock" in req.body) set.stock = Math.max(0, Math.floor(num(req.body.stock)));
+  if ("active" in req.body) set.active = bool(req.body.active);
+  if ("featured" in req.body) set.featured = bool(req.body.featured);
+  if ("discount_percent" in req.body) set.discount_percent = Math.min(100, Math.max(0, num(req.body.discount_percent)));
+  if (!Object.keys(set).length) throw new HttpError(400, "چیزی برای تغییر نیست.");
+  await saveVersioned("product", id, req.body.version, "این محصول", { ...set, updated_by: req.admin.name, updated_at: now() });
+  await log(req, "ویرایش سریع محصول", "product", id, req.body);
+  res.json(await adminProduct(id));
 }));
 
-r.delete("/products/:id", requireAdmin("products"), wrap((req, res) => {
+r.delete("/products/:id", requireAdmin("products"), wrap(async (req, res) => {
   const id = Number(req.params.id);
-  const p = db().prepare("SELECT title FROM products WHERE id=?").get(id);
+  const p = await one("product", { id }, { projection: { title: 1 } });
   if (!p) throw new HttpError(404, "محصول پیدا نشد.");
-  const files = db().prepare("SELECT filename FROM product_images WHERE product_id=?").all(id);
-  db().prepare("DELETE FROM products WHERE id=?").run(id);
+  const files = await many("image", { product_id: id });
+  await remove("product", { id });
+  await removeMany("image", { product_id: id });
+  // سفارش‌های قبلی می‌مونن؛ فقط ارجاع به محصول حذف‌شده خالی می‌شه
+  await raw().updateMany({ t: "order", "items.product_id": id }, { $set: { "items.$[i].product_id": null } }, { arrayFilters: [{ "i.product_id": id }] });
   for (const f of files) fs.rm(path.join(UPLOAD_DIR, f.filename), { force: true }, () => {});
-  log(req, "حذف محصول", "product", id, p.title);
+  await log(req, "حذف محصول", "product", id, p.title);
   res.json({ ok: true });
 }));
 
@@ -272,11 +290,11 @@ r.post("/products/:id/images", requireAdmin("products"), (req, res, next) =>
     if (err) return res.status(400).json({ error: err.code === "LIMIT_FILE_SIZE" ? "حجم هر عکس حداکثر ۸ مگابایت است." : "آپلود ناموفق بود: " + err.message });
     next();
   }),
-  wrap((req, res) => {
+  wrap(async (req, res) => {
     const id = Number(req.params.id);
     const files = req.files || [];
     const drop = () => files.forEach((f) => fs.rm(f.path, { force: true }, () => {}));
-    if (!db().prepare("SELECT 1 FROM products WHERE id=?").get(id)) {
+    if (!(await one("product", { id }, { projection: { id: 1 } }))) {
       drop();
       throw new HttpError(404, "محصول پیدا نشد.");
     }
@@ -284,112 +302,137 @@ r.post("/products/:id/images", requireAdmin("products"), (req, res, next) =>
     const bad = files.filter((f) => !isRealImage(f.path));
     bad.forEach((f) => fs.rm(f.path, { force: true }, () => {}));
     const good = files.filter((f) => !bad.includes(f));
-    let sort = db().prepare("SELECT COALESCE(MAX(sort),-1) m FROM product_images WHERE product_id=?").get(id).m;
-    const ins = db().prepare("INSERT INTO product_images (product_id,filename,sort,created_at) VALUES (?,?,?,?)");
-    tx(() => {
-      for (const f of good) ins.run(id, f.filename, ++sort, now());
-      db().prepare("UPDATE products SET updated_at=?, updated_by=? WHERE id=?").run(now(), req.admin.name, id);
-    });
-    log(req, "آپلود عکس محصول", "product", id, `${good.length} عکس`);
-    const p = adminProduct(id);
+    const last = await many("image", { product_id: id }, { sort: { sort: -1 }, limit: 1, projection: { sort: 1 } });
+    let sort = last.length ? last[0].sort : -1;
+    for (const f of good) await insert("image", { product_id: id, filename: f.filename, sort: ++sort, created_at: now() });
+    await update("product", { id }, { $set: { updated_at: now(), updated_by: req.admin.name } });
+    await log(req, "آپلود عکس محصول", "product", id, `${good.length} عکس`);
+    const p = await adminProduct(id);
     res.json({ images: p.images, warning: bad.length ? `${bad.length} فایل عکس معتبر نبود و رد شد.` : "" });
   }));
 
-r.delete("/images/:imageId", requireAdmin("products"), wrap((req, res) => {
-  const img = db().prepare("SELECT * FROM product_images WHERE id=?").get(Number(req.params.imageId));
+r.delete("/images/:imageId", requireAdmin("products"), wrap(async (req, res) => {
+  const img = await one("image", { id: Number(req.params.imageId) });
   if (!img) throw new HttpError(404, "عکس پیدا نشد.");
-  db().prepare("DELETE FROM product_images WHERE id=?").run(img.id);
+  await remove("image", { id: img.id });
   fs.rm(path.join(UPLOAD_DIR, img.filename), { force: true }, () => {});
-  log(req, "حذف عکس محصول", "product", img.product_id);
-  res.json({ images: adminProduct(img.product_id).images });
+  await log(req, "حذف عکس محصول", "product", img.product_id);
+  res.json({ images: (await adminProduct(img.product_id)).images });
 }));
 
-r.put("/products/:id/images/order", requireAdmin("products"), wrap((req, res) => {
+r.put("/products/:id/images/order", requireAdmin("products"), wrap(async (req, res) => {
   const id = Number(req.params.id);
   const ids = (req.body.ids || []).map(Number);
-  const st = db().prepare("UPDATE product_images SET sort=? WHERE id=? AND product_id=?");
-  tx(() => ids.forEach((imgId, i) => st.run(i, imgId, id)));
-  res.json({ images: adminProduct(id).images });
+  for (const [i, imgId] of ids.entries()) await update("image", { id: imgId, product_id: id }, { $set: { sort: i } });
+  res.json({ images: (await adminProduct(id)).images });
 }));
 
 // ======================= دسته‌بندی =======================
-r.get("/categories", requireAdmin("categories", "products"), (req, res) => {
-  res.json(db().prepare("SELECT c.*, (SELECT COUNT(*) FROM products WHERE category_id=c.id) product_count FROM categories c ORDER BY sort,id").all());
-});
+r.get("/categories", requireAdmin("categories", "products"), wrap(async (req, res) => {
+  const [cats, prods] = await Promise.all([many("category", {}, { sort: { sort: 1, id: 1 } }), many("product", {}, { projection: { category_id: 1 } })]);
+  const n = new Map();
+  for (const p of prods) n.set(p.category_id, (n.get(p.category_id) || 0) + 1);
+  res.json(cats.map((c) => ({ ...c, product_count: n.get(c.id) || 0 })));
+}));
 function catFields(b) {
   const f = { name: str(b.name, 60), slug: slugify(b.slug || b.name), description: str(b.description, 200), icon: str(b.icon, 20) || "ring", sort: Math.floor(num(b.sort)), active: bool(b.active ?? 1) };
   if (f.name.length < 2) throw new HttpError(400, "نام دسته را وارد کنید.");
   return f;
 }
-r.post("/categories", requireAdmin("categories"), wrap((req, res) => {
+r.post("/categories", requireAdmin("categories"), wrap(async (req, res) => {
   const f = catFields(req.body);
-  const id = db().prepare(`INSERT INTO categories (${Object.keys(f)}) VALUES (${Object.keys(f).map(() => "?")})`).run(...Object.values(f)).lastInsertRowid;
-  log(req, "افزودن دسته", "category", id, f.name);
+  const id = await insert("category", f);
+  await log(req, "افزودن دسته", "category", id, f.name);
   res.json({ id });
 }));
-r.put("/categories/:id", requireAdmin("categories"), wrap((req, res) => {
+r.put("/categories/:id", requireAdmin("categories"), wrap(async (req, res) => {
   const f = catFields(req.body);
-  db().prepare(`UPDATE categories SET ${Object.keys(f).map((k) => `${k}=?`)} WHERE id=?`).run(...Object.values(f), Number(req.params.id));
-  log(req, "ویرایش دسته", "category", req.params.id, f.name);
+  await update("category", { id: Number(req.params.id) }, { $set: f });
+  await log(req, "ویرایش دسته", "category", req.params.id, f.name);
   res.json({ ok: true });
 }));
-r.delete("/categories/:id", requireAdmin("categories"), wrap((req, res) => {
-  const c = db().prepare("SELECT name FROM categories WHERE id=?").get(Number(req.params.id));
+r.delete("/categories/:id", requireAdmin("categories"), wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const c = await one("category", { id }, { projection: { name: 1 } });
   if (!c) throw new HttpError(404, "دسته پیدا نشد.");
-  db().prepare("DELETE FROM categories WHERE id=?").run(Number(req.params.id));
-  log(req, "حذف دسته", "category", req.params.id, c.name);
+  await remove("category", { id });
+  await updateMany("product", { category_id: id }, { $set: { category_id: null } }); // محصول‌ها بدون دسته می‌مونن
+  await log(req, "حذف دسته", "category", req.params.id, c.name);
   res.json({ ok: true });
 }));
 
 // ======================= سفارش‌ها =======================
-r.get("/orders", requireAdmin("orders"), (req, res) => {
-  expireStale();
-  const where = [];
-  const args = [];
-  if (req.query.status === "open") where.push("status IN ('paid','awaiting_confirmation','processing','ready_pickup')");
-  else if (req.query.status) where.push("status=?"), args.push(req.query.status);
-  if (req.query.q) where.push("(code LIKE ? OR name LIKE ? OR phone LIKE ?)"), args.push(`%${req.query.q}%`, `%${req.query.q}%`, `%${req.query.q}%`);
+r.get("/orders", requireAdmin("orders"), wrap(async (req, res) => {
+  await expireStale();
+  const filter = {};
+  if (req.query.status === "open") filter.status = { $in: ["paid", "awaiting_confirmation", "processing", "ready_pickup"] };
+  else if (req.query.status) filter.status = String(req.query.status);
+  if (req.query.q) filter.$or = [{ code: like(req.query.q) }, { name: like(req.query.q) }, { phone: like(req.query.q) }];
   const page = Math.max(1, Number(req.query.page) || 1);
-  const W = where.length ? "WHERE " + where.join(" AND ") : "";
-  const total = db().prepare(`SELECT COUNT(*) c FROM orders ${W}`).get(...args).c;
-  const rows = db().prepare(`SELECT id,code,name,phone,city,total,status,payment_method,delivery,created_at,paid_at,(SELECT SUM(qty) FROM order_items WHERE order_id=orders.id) items FROM orders ${W} ORDER BY id DESC LIMIT 30 OFFSET ?`).all(...args, (page - 1) * 30);
-  res.json({ total, page, pages: Math.max(1, Math.ceil(total / 30)), rows: rows.map((o) => ({ ...o, status_title: STATUSES[o.status] })) });
-});
+  const [total, rows] = await Promise.all([
+    count("order", filter),
+    many("order", filter, {
+      projection: { id: 1, code: 1, name: 1, phone: 1, city: 1, total: 1, status: 1, payment_method: 1, delivery: 1, created_at: 1, paid_at: 1, "items.qty": 1 },
+      sort: { id: -1 }, skip: (page - 1) * 30, limit: 30,
+    }),
+  ]);
+  res.json({
+    total, page, pages: Math.max(1, Math.ceil(total / 30)),
+    rows: rows.map(({ items, ...o }) => ({ ...o, items: (items || []).reduce((a, i) => a + i.qty, 0), status_title: STATUSES[o.status] })),
+  });
+}));
 
-r.get("/orders/:code", requireAdmin("orders"), (req, res) => {
-  const o = getOrder(req.params.code);
+r.get("/orders/:code", requireAdmin("orders"), wrap(async (req, res) => {
+  const o = await getOrder(req.params.code);
   if (!o) return res.status(404).json({ error: "سفارش پیدا نشد." });
   o.items = o.items.map((i) => ({ ...i, breakdown: JSON.parse(i.breakdown || "{}") }));
-  o.history = db().prepare("SELECT username,action,details,created_at FROM activity_log WHERE entity='order' AND entity_id=? ORDER BY id DESC").all(o.code);
+  o.history = await many("log", { entity: "order", entity_id: o.code }, { projection: { username: 1, action: 1, details: 1, created_at: 1 }, sort: { id: -1 } });
   res.json(o);
-});
+}));
 
-r.put("/orders/:code", requireAdmin("orders"), wrap((req, res) => {
-  const o = getOrder(req.params.code);
+r.put("/orders/:code", requireAdmin("orders"), wrap(async (req, res) => {
+  const o = await getOrder(req.params.code);
   if (!o) throw new HttpError(404, "سفارش پیدا نشد.");
   const next = req.body.status || o.status;
-  tx(() => {
-    checkVersion("orders", o.id, req.body.version, "این سفارش");
-    if (next !== o.status) changeStatus(o, next);
-    db().prepare("UPDATE orders SET status=?, tracking_code=?, admin_note=?, paid_at=COALESCE(paid_at, CASE WHEN ? IN ('paid','processing','shipped','ready_pickup','delivered') THEN ? END), updated_at=?, version=version+1 WHERE id=?")
-      .run(next, str(req.body.tracking_code ?? o.tracking_code, 60), str(req.body.admin_note ?? o.admin_note, 2000), next, now(), now(), o.id);
-  });
+  const set = {
+    status: next,
+    tracking_code: str(req.body.tracking_code ?? o.tracking_code, 60),
+    admin_note: str(req.body.admin_note ?? o.admin_note, 2000),
+    updated_at: now(),
+  };
+  if (!o.paid_at && PAID_STATUSES.includes(next)) set.paid_at = now();
+  await saveVersioned("order", o.id, req.body.version, "این سفارش", set);
+  if (next !== o.status) {
+    try {
+      await changeStatus(o, next);
+    } catch (e) {
+      // موجودی کافی نبود: تغییر سفارش برگردانده می‌شه
+      await raw().updateOne({ t: "order", id: o.id }, { $set: { status: o.status, tracking_code: o.tracking_code, admin_note: o.admin_note, paid_at: o.paid_at ?? null, updated_at: now() }, $inc: { version: 1 } });
+      throw e;
+    }
+  }
   const changes = [];
   if (next !== o.status) changes.push(`وضعیت: ${STATUSES[o.status]} → ${STATUSES[next]}`);
   if ((req.body.tracking_code ?? o.tracking_code) !== o.tracking_code) changes.push(`کد رهگیری: ${req.body.tracking_code}`);
   if ((req.body.admin_note ?? o.admin_note) !== o.admin_note) changes.push("یادداشت تغییر کرد");
-  if (changes.length) log(req, "ویرایش سفارش", "order", o.code, changes.join("، "));
+  if (changes.length) await log(req, "ویرایش سفارش", "order", o.code, changes.join("، "));
   res.json({ ok: true });
 }));
 
 // ======================= مشتری‌ها =======================
-r.get("/customers", requireAdmin("customers"), (req, res) => {
-  const q = req.query.q ? `%${req.query.q}%` : "%";
-  res.json(db().prepare(`SELECT c.id,c.phone,c.name,c.city,c.created_at,
-    (SELECT COUNT(*) FROM orders WHERE customer_id=c.id AND status IN ('paid','processing','shipped','ready_pickup','delivered')) orders,
-    (SELECT COALESCE(SUM(total),0) FROM orders WHERE customer_id=c.id AND status IN ('paid','processing','shipped','ready_pickup','delivered')) spent
-    FROM customers c WHERE c.phone LIKE ? OR c.name LIKE ? ORDER BY c.id DESC LIMIT 200`).all(q, q));
-});
+r.get("/customers", requireAdmin("customers"), wrap(async (req, res) => {
+  const filter = req.query.q ? { $or: [{ phone: like(req.query.q) }, { name: like(req.query.q) }] } : {};
+  const list = await many("customer", filter, { projection: { id: 1, phone: 1, name: 1, city: 1, created_at: 1 }, sort: { id: -1 }, limit: 200 });
+  const orders = list.length ? await many("order", { customer_id: { $in: list.map((c) => c.id) }, status: { $in: PAID_STATUSES } }, { projection: { customer_id: 1, total: 1 } }) : [];
+  const agg = new Map();
+  for (const o of orders) {
+    const a = agg.get(o.customer_id) || { orders: 0, spent: 0 };
+    a.orders++;
+    a.spent += o.total;
+    agg.set(o.customer_id, a);
+  }
+  res.json(list.map((c) => ({ ...c, orders: agg.get(c.id)?.orders || 0, spent: agg.get(c.id)?.spent || 0 })));
+}));
 
 // ======================= تنظیمات =======================
 const GOLD_KEYS = ["gold_rate_18", "vat_percent", "ticker_extra", "gold_rate_updated_at"];
@@ -397,26 +440,27 @@ const CHANNEL_KEYS = Object.keys(DEFAULTS).filter((k) => /^(torob|emalls|google_
 const STORE_KEYS = Object.keys(DEFAULTS).filter((k) => !GOLD_KEYS.includes(k) && !CHANNEL_KEYS.includes(k));
 const pick = (obj, keys) => Object.fromEntries(keys.filter((k) => k in obj).map((k) => [k, obj[k]]));
 
-r.get("/settings", requireAdmin("settings"), (req, res) => {
-  res.json({ values: pick(getSettings(), STORE_KEYS), gateways: GATEWAYS.map((g) => ({ id: g.id, title: g.title, callback: `${siteUrl()}/api/payment/callback/${g.id}` })) });
-});
-r.put("/settings", requireAdmin("settings"), wrap((req, res) => {
+r.get("/settings", requireAdmin("settings"), wrap(async (req, res) => {
+  res.json({ values: pick(await getSettings(), STORE_KEYS), gateways: GATEWAYS.map((g) => ({ id: g.id, title: g.title, callback: `${siteUrl()}/api/payment/callback/${g.id}` })) });
+}));
+r.put("/settings", requireAdmin("settings"), wrap(async (req, res) => {
   const vals = pick(req.body, STORE_KEYS);
-  setSettings(vals);
-  log(req, "تغییر تنظیمات", "settings", "", Object.keys(vals).filter((k) => !k.endsWith("merchant")).join("، "));
+  await setSettings(vals);
+  await log(req, "تغییر تنظیمات", "settings", "", Object.keys(vals).filter((k) => !k.endsWith("merchant")).join("، "));
   res.json({ ok: true });
 }));
 r.post("/settings/test/:gateway", requireAdmin("settings"), wrap(async (req, res) => {
   const g = gateway(req.params.gateway);
   if (!g?.test) throw new HttpError(400, "این درگاه تست اتصال ندارد.");
-  res.json(await g.test({ ...getSettings(), ...pick(req.body, STORE_KEYS) }, `${siteUrl()}/api/payment/callback/${g.id}`));
+  res.json(await g.test({ ...(await getSettings()), ...pick(req.body, STORE_KEYS) }, `${siteUrl()}/api/payment/callback/${g.id}`));
 }));
 
 // ======================= کانال‌های فروش =======================
-r.get("/channels", requireAdmin("channels"), (req, res) => {
+r.get("/channels", requireAdmin("channels"), wrap(async (req, res) => {
   const base = siteUrl();
-  const s = getSettings();
-  const stats = db().prepare("SELECT COUNT(*) total, SUM(basalam_id IS NOT NULL) synced, SUM(basalam_error IS NOT NULL) errors, MAX(basalam_synced_at) last FROM products").get();
+  const s = await getSettings();
+  const prods = await many("product", {}, { projection: { id: 1, title: 1, basalam_id: 1, basalam_error: 1, basalam_synced_at: 1 } });
+  const withErr = prods.filter((p) => p.basalam_error != null);
   res.json({
     values: pick(s, CHANNEL_KEYS),
     feeds: {
@@ -426,47 +470,59 @@ r.get("/channels", requireAdmin("channels"), (req, res) => {
       csv: `${base}/feeds/products.csv`,
       sitemap: `${base}/sitemap.xml`,
     },
-    basalam: { ready: basalam.basalamReady(), ...stats },
-    errors: db().prepare("SELECT id,title,basalam_error FROM products WHERE basalam_error IS NOT NULL LIMIT 20").all(),
+    basalam: {
+      ready: await basalam.basalamReady(),
+      total: prods.length,
+      synced: prods.filter((p) => p.basalam_id != null).length,
+      errors: withErr.length,
+      last: prods.reduce((m, p) => (p.basalam_synced_at && p.basalam_synced_at > (m || "") ? p.basalam_synced_at : m), null),
+    },
+    errors: withErr.slice(0, 20).map((p) => ({ id: p.id, title: p.title, basalam_error: p.basalam_error })),
   });
-});
-r.put("/channels", requireAdmin("channels"), wrap((req, res) => {
-  setSettings(pick(req.body, CHANNEL_KEYS));
-  log(req, "تغییر تنظیمات کانال‌های فروش", "settings");
+}));
+r.put("/channels", requireAdmin("channels"), wrap(async (req, res) => {
+  await setSettings(pick(req.body, CHANNEL_KEYS));
+  await log(req, "تغییر تنظیمات کانال‌های فروش", "settings");
   res.json({ ok: true });
 }));
-r.post("/channels/token/:which", requireAdmin("channels"), wrap((req, res) => {
+r.post("/channels/token/:which", requireAdmin("channels"), wrap(async (req, res) => {
   const key = req.params.which === "emalls" ? "emalls_token" : "torob_token";
   const token = crypto.randomBytes(16).toString("hex");
-  setSettings({ [key]: token });
-  log(req, "ساخت توکن فید", "settings", key);
+  await setSettings({ [key]: token });
+  await log(req, "ساخت توکن فید", "settings", key);
   res.json({ token });
 }));
 r.post("/channels/basalam/test", requireAdmin("channels"), wrap(async (req, res) => {
   const w = await basalam.whoAmI();
-  if (w.ok && w.vendorId && !getSettings().basalam_vendor_id) setSettings({ basalam_vendor_id: w.vendorId });
+  if (w.ok && w.vendorId && !(await getSettings()).basalam_vendor_id) await setSettings({ basalam_vendor_id: w.vendorId });
   res.json(w);
 }));
 r.get("/channels/basalam/categories", requireAdmin("channels"), wrap(async (req, res) => res.json(await basalam.categories(req.query.q))));
 r.post("/channels/basalam/sync/:id", requireAdmin("channels", "products"), wrap(async (req, res) => {
   const out = await basalam.pushProduct(Number(req.params.id));
-  log(req, "ارسال محصول به باسلام", "product", req.params.id, out.message);
+  await log(req, "ارسال محصول به باسلام", "product", req.params.id, out.message);
   res.json(out);
 }));
 r.post("/channels/basalam/sync-all", requireAdmin("channels"), wrap(async (req, res) => {
   const out = await basalam.pushAll();
-  log(req, "همگام‌سازی همه‌ی محصولات با باسلام", "settings", "", `${out.ok} موفق، ${out.fail} ناموفق`);
+  await log(req, "همگام‌سازی همه‌ی محصولات با باسلام", "settings", "", `${out.ok} موفق، ${out.fail} ناموفق`);
   res.json(out);
 }));
 
 // ======================= کاربران پنل =======================
-r.get("/users", requireAdmin("users"), (req, res) => {
+r.get("/users", requireAdmin("users"), wrap(async (req, res) => {
   const since = new Date(Date.now() - 15 * 60_000).toISOString();
-  res.json(db().prepare(`SELECT id,username,name,role,perms,active,created_at,last_login,
-    (SELECT COUNT(*) FROM sessions WHERE kind='admin' AND subject_id=users.id AND expires_at > ?) sessions,
-    (SELECT MAX(last_seen) FROM sessions WHERE kind='admin' AND subject_id=users.id) last_seen
-    FROM users ORDER BY id`).all(now()).map((u) => ({ ...u, perms: JSON.parse(u.perms || "[]"), online: !!u.last_seen && u.last_seen >= since })));
-});
+  const [users, sessions] = await Promise.all([
+    many("user", {}, { projection: { id: 1, username: 1, name: 1, role: 1, perms: 1, active: 1, created_at: 1, last_login: 1 }, sort: { id: 1 } }),
+    many("session", { kind: "admin" }, { projection: { subject_id: 1, expires_at: 1, last_seen: 1 } }),
+  ]);
+  const t = now();
+  res.json(users.map((u) => {
+    const mine = sessions.filter((x) => x.subject_id === u.id);
+    const lastSeen = mine.reduce((m, x) => (x.last_seen > (m || "") ? x.last_seen : m), null);
+    return { ...u, perms: JSON.parse(u.perms || "[]"), sessions: mine.filter((x) => x.expires_at > t).length, last_seen: lastSeen, online: !!lastSeen && lastSeen >= since };
+  }));
+}));
 
 function userFields(b, isNew) {
   const f = {
@@ -483,62 +539,61 @@ function userFields(b, isNew) {
   if (f.role === "custom" && f.perms === "[]") throw new HttpError(400, "برای نقش سفارشی حداقل یک دسترسی انتخاب کنید.");
   return f;
 }
-const ownersLeft = (exceptId) => db().prepare("SELECT COUNT(*) c FROM users WHERE role='owner' AND active=1 AND id!=?").get(exceptId).c;
+const ownersLeft = (exceptId) => count("user", { role: "owner", active: 1, id: { $ne: exceptId } });
 
-r.post("/users", requireAdmin("users"), wrap((req, res) => {
+r.post("/users", requireAdmin("users"), wrap(async (req, res) => {
   const f = userFields(req.body, true);
   if (str(req.body.password).length < 8) throw new HttpError(400, "رمز عبور حداقل ۸ کاراکتر باشد.");
   if (f.role === "owner" && req.admin.role !== "owner") throw new HttpError(403, "فقط مدیر کل می‌تواند مدیر کل جدید بسازد.");
-  const id = db().prepare("INSERT INTO users (username,name,password_hash,role,perms,active,created_at) VALUES (?,?,?,?,?,?,?)")
-    .run(f.username, f.name, hashPassword(req.body.password), f.role, f.perms, f.active, now()).lastInsertRowid;
-  log(req, "افزودن کاربر پنل", "user", id, `${f.username} (${ROLES[f.role].title})`);
+  const id = await insert("user", { ...f, password_hash: hashPassword(req.body.password), created_at: now(), last_login: null });
+  await log(req, "افزودن کاربر پنل", "user", id, `${f.username} (${ROLES[f.role].title})`);
   res.json({ id });
 }));
 
-r.put("/users/:id", requireAdmin("users"), wrap((req, res) => {
+r.put("/users/:id", requireAdmin("users"), wrap(async (req, res) => {
   const id = Number(req.params.id);
-  const u = db().prepare("SELECT * FROM users WHERE id=?").get(id);
+  const u = await one("user", { id });
   if (!u) throw new HttpError(404, "کاربر پیدا نشد.");
   const f = userFields(req.body, false);
   if ((u.role === "owner" || f.role === "owner") && req.admin.role !== "owner") throw new HttpError(403, "فقط مدیر کل می‌تواند مدیر کل را تغییر دهد.");
-  if (u.role === "owner" && (f.role !== "owner" || !f.active) && ownersLeft(id) === 0) throw new HttpError(400, "حداقل یک مدیر کل فعال باید باقی بماند.");
+  if (u.role === "owner" && (f.role !== "owner" || !f.active) && (await ownersLeft(id)) === 0) throw new HttpError(400, "حداقل یک مدیر کل فعال باید باقی بماند.");
   if (id === req.admin.id && !f.active) throw new HttpError(400, "نمی‌توانید حساب خودتان را غیرفعال کنید.");
-  db().prepare("UPDATE users SET name=?, role=?, perms=?, active=? WHERE id=?").run(f.name, f.role, f.perms, f.active, id);
+  const set = { name: f.name, role: f.role, perms: f.perms, active: f.active };
   if (req.body.password) {
     if (str(req.body.password).length < 8) throw new HttpError(400, "رمز عبور حداقل ۸ کاراکتر باشد.");
-    db().prepare("UPDATE users SET password_hash=? WHERE id=?").run(hashPassword(req.body.password), id);
+    set.password_hash = hashPassword(req.body.password);
   }
-  if (!f.active || req.body.password) killSessions("admin", id, id === req.admin.id ? req.admin.token : "");
-  log(req, "ویرایش کاربر پنل", "user", id, `${u.username}: ${ROLES[f.role].title}${f.active ? "" : "، غیرفعال"}${req.body.password ? "، تغییر رمز" : ""}`);
+  await update("user", { id }, { $set: set });
+  if (!f.active || req.body.password) await killSessions("admin", id, id === req.admin.id ? req.admin.token : "");
+  await log(req, "ویرایش کاربر پنل", "user", id, `${u.username}: ${ROLES[f.role].title}${f.active ? "" : "، غیرفعال"}${req.body.password ? "، تغییر رمز" : ""}`);
   res.json({ ok: true });
 }));
 
-r.post("/users/:id/logout", requireAdmin("users"), wrap((req, res) => {
+r.post("/users/:id/logout", requireAdmin("users"), wrap(async (req, res) => {
   const id = Number(req.params.id);
-  killSessions("admin", id, id === req.admin.id ? req.admin.token : "");
-  log(req, "خروج اجباری کاربر از همه‌ی دستگاه‌ها", "user", id);
+  await killSessions("admin", id, id === req.admin.id ? req.admin.token : "");
+  await log(req, "خروج اجباری کاربر از همه‌ی دستگاه‌ها", "user", id);
   res.json({ ok: true });
 }));
 
-r.delete("/users/:id", requireAdmin("users"), wrap((req, res) => {
+r.delete("/users/:id", requireAdmin("users"), wrap(async (req, res) => {
   const id = Number(req.params.id);
-  const u = db().prepare("SELECT * FROM users WHERE id=?").get(id);
+  const u = await one("user", { id });
   if (!u) throw new HttpError(404, "کاربر پیدا نشد.");
   if (id === req.admin.id) throw new HttpError(400, "نمی‌توانید حساب خودتان را حذف کنید.");
   if (u.role === "owner" && req.admin.role !== "owner") throw new HttpError(403, "فقط مدیر کل می‌تواند مدیر کل را حذف کند.");
-  if (u.role === "owner" && ownersLeft(id) === 0) throw new HttpError(400, "حداقل یک مدیر کل فعال باید باقی بماند.");
-  killSessions("admin", id, "");
-  db().prepare("DELETE FROM users WHERE id=?").run(id);
-  log(req, "حذف کاربر پنل", "user", id, u.username);
+  if (u.role === "owner" && (await ownersLeft(id)) === 0) throw new HttpError(400, "حداقل یک مدیر کل فعال باید باقی بماند.");
+  await killSessions("admin", id, "");
+  await remove("user", { id });
+  await log(req, "حذف کاربر پنل", "user", id, u.username);
   res.json({ ok: true });
 }));
 
 // ======================= گزارش فعالیت =======================
-r.get("/logs", requireAdmin("logs"), (req, res) => {
+r.get("/logs", requireAdmin("logs"), wrap(async (req, res) => {
   const page = Math.max(1, Number(req.query.page) || 1);
-  const where = req.query.user ? "WHERE user_id=?" : "";
-  const args = req.query.user ? [Number(req.query.user)] : [];
-  res.json(db().prepare(`SELECT * FROM activity_log ${where} ORDER BY id DESC LIMIT 50 OFFSET ?`).all(...args, (page - 1) * 50));
-});
+  const filter = req.query.user ? { user_id: Number(req.query.user) } : {};
+  res.json(await many("log", filter, { sort: { id: -1 }, skip: (page - 1) * 50, limit: 50 }));
+}));
 
 export default r;

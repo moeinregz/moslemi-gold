@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { db, now, tx } from "./db.js";
+import { raw, one, many, insert, update, updateMany, now } from "./db.js";
 import { getSettings, num } from "./settings.js";
 import { priceProduct } from "./pricing.js";
 
@@ -15,7 +15,8 @@ export const STATUSES = {
   failed: "پرداخت ناموفق",
 };
 // وضعیت‌هایی که موجودی انبار ازشون کم شده
-const STOCK_TAKEN = ["awaiting_confirmation", "paid", "processing", "shipped", "ready_pickup", "delivered"];
+export const STOCK_TAKEN = ["awaiting_confirmation", "paid", "processing", "shipped", "ready_pickup", "delivered"];
+export const PAID_STATUSES = ["paid", "processing", "shipped", "ready_pickup", "delivered"];
 
 export class OrderError extends Error {}
 
@@ -23,13 +24,14 @@ export class OrderError extends Error {}
  * محاسبه‌ی قیمت سبد سمت سرور (قیمت از مرورگر قبول نمی‌شه)
  * items: [{ product_id, qty }]
  */
-export function quote(items, delivery = "post", s = getSettings()) {
+export async function quote(items, delivery = "post", s) {
+  s ??= await getSettings();
   if (!Array.isArray(items) || !items.length) throw new OrderError("سبد خرید خالی است.");
   const lines = [];
   const issues = [];
   for (const it of items.slice(0, 50)) {
     const qty = Math.max(1, Math.min(20, Math.floor(Number(it.qty) || 1)));
-    const p = db().prepare("SELECT * FROM products WHERE id = ?").get(Number(it.product_id));
+    const p = await one("product", { id: Number(it.product_id) });
     if (!p || !p.active) {
       issues.push({ product_id: Number(it.product_id), message: "این محصول دیگر موجود نیست." });
       continue;
@@ -48,10 +50,10 @@ export function quote(items, delivery = "post", s = getSettings()) {
   return { lines, issues, subtotal, shipping, total: subtotal + shipping, gold_rate: num(s.gold_rate_18), delivery };
 }
 
-function newCode() {
+async function newCode() {
   for (;;) {
     const code = String(crypto.randomInt(10_000_000, 99_999_999));
-    if (!db().prepare("SELECT 1 FROM orders WHERE code=?").get(code)) return code;
+    if (!(await one("order", { code }, { projection: { id: 1 } }))) return code;
   }
 }
 
@@ -64,10 +66,10 @@ export const normalizePhone = (p) =>
     .replace(/^98/, "0")
     .replace(/^9/, "09");
 
-export function createOrder(body, customer) {
-  const s = getSettings();
+export async function createOrder(body, customer) {
+  const s = await getSettings();
   const delivery = body.delivery === "pickup" && s.pickup_enabled === "1" ? "pickup" : "post";
-  const q = quote(body.items, delivery, s);
+  const q = await quote(body.items, delivery, s);
   if (q.issues.length) throw Object.assign(new OrderError("بعضی از اقلام سبد تغییر کرده‌اند؛ سبد را بررسی کنید."), { issues: q.issues });
   const name = clean(body.name, 80);
   const phone = normalizePhone(body.phone);
@@ -79,87 +81,105 @@ export function createOrder(body, customer) {
     if (addr.postal_code && addr.postal_code.length !== 10) throw new OrderError("کد پستی باید ۱۰ رقم باشد.");
   }
   const t = now();
-  return tx(() => {
-    const code = newCode();
-    const r = db().prepare(`INSERT INTO orders (code,customer_id,name,phone,province,city,address,postal_code,note,delivery,subtotal,shipping,total,status,payment_method,gold_rate,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'pending_payment',?,?,?,?)`).run(
-      code, customer?.id ?? null, name, phone, addr.province, addr.city, addr.address, addr.postal_code, clean(body.note, 500), delivery,
-      q.subtotal, q.shipping, q.total, clean(body.payment_method, 20), q.gold_rate, t, t);
-    const ins = db().prepare("INSERT INTO order_items (order_id,product_id,title,karat,weight,unit_price,qty,breakdown) VALUES (?,?,?,?,?,?,?,?)");
-    for (const l of q.lines) ins.run(r.lastInsertRowid, l.product_id, l.title, l.karat, l.weight, l.unit_price, l.qty, JSON.stringify(l.breakdown));
-    return getOrder(code);
+  const code = await newCode();
+  await insert("order", {
+    code, customer_id: customer?.id ?? null, name, phone, ...addr, note: clean(body.note, 500), delivery,
+    subtotal: q.subtotal, shipping: q.shipping, total: q.total, status: "pending_payment", payment_method: clean(body.payment_method, 20),
+    payment_authority: null, payment_ref: null, payment_meta: null, tracking_code: "", admin_note: "", gold_rate: q.gold_rate,
+    version: 1, created_at: t, updated_at: t, paid_at: null,
+    // اقلام سفارش داخل خود سند سفارش ذخیره می‌شن
+    items: q.lines.map((l, i) => ({ id: i + 1, product_id: l.product_id, title: l.title, karat: l.karat, weight: l.weight, unit_price: l.unit_price, qty: l.qty, breakdown: JSON.stringify(l.breakdown) })),
   });
+  return getOrder(code);
 }
 
-export function getOrder(code) {
-  const o = db().prepare("SELECT * FROM orders WHERE code=?").get(String(code));
+export async function getOrder(code) {
+  const o = await one("order", { code: String(code) });
   if (!o) return null;
-  o.items = db().prepare("SELECT * FROM order_items WHERE order_id=?").all(o.id);
+  o.items ??= [];
   o.status_title = STATUSES[o.status] || o.status;
   return o;
 }
 
-/** کم کردن موجودی؛ اگه موجودی کافی نباشه خطا */
-function takeStock(order) {
+/** کم کردن موجودی (اتمیک)؛ اگه موجودی کافی نباشه، آنچه کم شده برمی‌گرده و خطا می‌ده */
+async function takeStock(order) {
+  const taken = [];
   for (const it of order.items) {
     if (!it.product_id) continue;
-    const r = db().prepare("UPDATE products SET stock = stock - ?, sold_count = sold_count + ? WHERE id = ? AND stock >= ?").run(it.qty, it.qty, it.product_id, it.qty);
-    if (!r.changes) throw new OrderError(`موجودی «${it.title}» کافی نیست.`);
+    const r = await raw().updateOne(
+      { t: "product", id: it.product_id, stock: { $gte: it.qty } },
+      { $inc: { stock: -it.qty, sold_count: it.qty } },
+    );
+    if (!r.modifiedCount) {
+      await returnStock({ items: taken });
+      throw new OrderError(`موجودی «${it.title}» کافی نیست.`);
+    }
+    taken.push(it);
   }
 }
-function returnStock(order) {
+async function returnStock(order) {
   for (const it of order.items) {
-    if (it.product_id) db().prepare("UPDATE products SET stock = stock + ?, sold_count = MAX(0, sold_count - ?) WHERE id = ?").run(it.qty, it.qty, it.product_id);
+    if (!it.product_id) continue;
+    await raw().updateOne({ t: "product", id: it.product_id }, [
+      { $set: { stock: { $add: ["$stock", it.qty] }, sold_count: { $max: [0, { $subtract: ["$sold_count", it.qty] }] } } },
+    ]);
   }
 }
 
 /** پرداخت آنلاین موفق شد */
-export function markPaid(code, ref, meta) {
-  return tx(() => {
-    const o = getOrder(code);
-    if (!o) throw new OrderError("سفارش پیدا نشد.");
-    if (STOCK_TAKEN.includes(o.status)) return o; // تکراری (مثلاً رفرش صفحه‌ی بازگشت)
-    let note = "";
-    try {
-      takeStock(o);
-    } catch (e) {
-      // پول گرفته شده ولی موجودی تموم شده: سفارش پرداخت‌شده ثبت می‌شه و مدیر باید پیگیری کنه
-      note = `هشدار: ${e.message} (هم‌زمان با پرداخت ناموجود شد؛ با مشتری تماس بگیرید)`;
-    }
-    db().prepare("UPDATE orders SET status='paid', payment_ref=?, payment_meta=?, paid_at=?, updated_at=?, version=version+1, admin_note=TRIM(admin_note || ' ' || ?) WHERE id=?")
-      .run(ref, meta ? JSON.stringify(meta) : null, now(), now(), note, o.id);
-    return getOrder(code);
-  });
+export async function markPaid(code, ref, meta) {
+  const o = await getOrder(code);
+  if (!o) throw new OrderError("سفارش پیدا نشد.");
+  if (STOCK_TAKEN.includes(o.status)) return o; // تکراری (مثلاً رفرش صفحه‌ی بازگشت)
+  // تغییر وضعیت اتمیک: اگه دو درخواست هم‌زمان برسن فقط یکی موفق می‌شه و موجودی دوبار کم نمی‌شه
+  const t = now();
+  const claim = await raw().updateOne(
+    { t: "order", id: o.id, status: { $nin: STOCK_TAKEN } },
+    { $set: { status: "paid", payment_ref: ref, payment_meta: meta ? JSON.stringify(meta) : null, paid_at: t, updated_at: t }, $inc: { version: 1 } },
+  );
+  if (!claim.modifiedCount) return getOrder(code);
+  try {
+    await takeStock(o);
+  } catch (e) {
+    // پول گرفته شده ولی موجودی تموم شده: سفارش پرداخت‌شده ثبت می‌شه و مدیر باید پیگیری کنه
+    const note = `هشدار: ${e.message} (هم‌زمان با پرداخت ناموجود شد؛ با مشتری تماس بگیرید)`;
+    await update("order", { id: o.id }, { $set: { admin_note: `${o.admin_note || ""} ${note}`.trim() } });
+  }
+  return getOrder(code);
 }
 
-export function markFailed(code, reason) {
-  db().prepare("UPDATE orders SET status='failed', payment_meta=?, updated_at=?, version=version+1 WHERE code=? AND status='pending_payment'").run(JSON.stringify({ error: reason }), now(), code);
+export async function markFailed(code, reason) {
+  await update("order", { code: String(code), status: "pending_payment" }, { $set: { status: "failed", payment_meta: JSON.stringify({ error: reason }), updated_at: now() }, $inc: { version: 1 } });
   return getOrder(code);
 }
 
 /** سفارش پرداخت حضوری: موجودی رزرو می‌شه تا مدیر تأیید یا لغو کنه */
-export function markOffline(code) {
-  return tx(() => {
-    const o = getOrder(code);
-    if (o.status !== "pending_payment") return o;
-    takeStock(o);
-    db().prepare("UPDATE orders SET status='awaiting_confirmation', payment_method='offline', updated_at=?, version=version+1 WHERE id=?").run(now(), o.id);
-    return getOrder(code);
-  });
+export async function markOffline(code) {
+  const o = await getOrder(code);
+  if (o.status !== "pending_payment") return o;
+  const claim = await update("order", { id: o.id, status: "pending_payment" }, { $set: { status: "awaiting_confirmation", payment_method: "offline", updated_at: now() }, $inc: { version: 1 } });
+  if (!claim.modifiedCount) return getOrder(code);
+  try {
+    await takeStock(o);
+  } catch (e) {
+    await update("order", { id: o.id }, { $set: { status: "pending_payment", payment_method: o.payment_method, updated_at: now() }, $inc: { version: 1 } });
+    throw e;
+  }
+  return getOrder(code);
 }
 
 /** تغییر وضعیت از پنل؛ موجودی رو هماهنگ نگه می‌داره */
-export function changeStatus(o, next) {
+export async function changeStatus(o, next) {
   if (!(next in STATUSES)) throw new OrderError("وضعیت نامعتبر است.");
   const had = STOCK_TAKEN.includes(o.status);
   const will = STOCK_TAKEN.includes(next);
-  if (!had && will) takeStock(o);
-  if (had && !will) returnStock(o);
+  if (!had && will) await takeStock(o);
+  if (had && !will) await returnStock(o);
 }
 
 /** سفارش‌های پرداخت‌نشده‌ی قدیمی رو منقضی می‌کنه */
-export function expireStale() {
-  const mins = num(getSettings().order_expire_minutes, 30);
+export async function expireStale() {
+  const mins = num((await getSettings()).order_expire_minutes, 30);
   const cutoff = new Date(Date.now() - mins * 60_000).toISOString();
-  db().prepare("UPDATE orders SET status='failed', payment_meta=?, updated_at=? WHERE status='pending_payment' AND created_at < ?").run(JSON.stringify({ error: "مهلت پرداخت تمام شد" }), now(), cutoff);
+  await updateMany("order", { status: "pending_payment", created_at: { $lt: cutoff } }, { $set: { status: "failed", payment_meta: JSON.stringify({ error: "مهلت پرداخت تمام شد" }), updated_at: now() } });
 }

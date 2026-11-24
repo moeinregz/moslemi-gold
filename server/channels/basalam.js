@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { db, now, UPLOAD_DIR } from "../db.js";
+import { one, many, update, now, UPLOAD_DIR } from "../db.js";
 import { getSettings } from "../settings.js";
 import { getById } from "../catalog.js";
 
@@ -17,8 +17,8 @@ import { getById } from "../catalog.js";
 const PUBLISHED = 2976;
 const UNPUBLISHED = 3790;
 
-function cfg() {
-  const s = getSettings();
+async function cfg() {
+  const s = await getSettings();
   return {
     base: (s.basalam_base_url || "https://openapi.basalam.com").trim().replace(/\/+$/, "").replace(/\/v1$/, ""),
     token: (s.basalam_token || "").trim(),
@@ -28,13 +28,13 @@ function cfg() {
     mul: s.basalam_price_unit === "toman" ? 1 : 10,
   };
 }
-export const basalamReady = () => {
-  const c = cfg();
+export const basalamReady = async () => {
+  const c = await cfg();
   return !!(c.token && c.vendor && c.category);
 };
 
 async function api(method, url, body) {
-  const c = cfg();
+  const c = await cfg();
   const res = await fetch(c.base + url, {
     method,
     headers: { Authorization: `Bearer ${c.token}`, Accept: "application/json", ...(body !== undefined ? { "Content-Type": "application/json" } : {}) },
@@ -51,7 +51,7 @@ function errText(j, status) {
 }
 
 async function uploadPhoto(filename) {
-  const c = cfg();
+  const c = await cfg();
   const file = path.join(UPLOAD_DIR, path.basename(filename));
   if (!fs.existsSync(file)) return null;
   const ext = path.extname(file).toLowerCase();
@@ -65,10 +65,10 @@ async function uploadPhoto(filename) {
 }
 
 export async function pushProduct(productId) {
-  const c = cfg();
-  if (!basalamReady()) return { ok: false, message: "اول توکن، شناسه‌ی غرفه و شناسه‌ی دسته‌ی باسلام را در «کانال‌های فروش» وارد کنید." };
-  const raw = db().prepare("SELECT * FROM products WHERE id=?").get(productId);
-  const p = getById(productId);
+  const c = await cfg();
+  if (!(await basalamReady())) return { ok: false, message: "اول توکن، شناسه‌ی غرفه و شناسه‌ی دسته‌ی باسلام را در «کانال‌های فروش» وارد کنید." };
+  const raw = await one("product", { id: Number(productId) });
+  const p = await getById(productId);
   if (!raw || !p) return { ok: false, message: "محصول پیدا نشد." };
   const body = {
     name: p.title.slice(0, 120),
@@ -93,7 +93,7 @@ export async function pushProduct(productId) {
       const id = await uploadPhoto(main).catch(() => null);
       if (id) {
         body.photo = id;
-        db().prepare("UPDATE products SET basalam_photo=? WHERE id=?").run(`${main}|${id}`, p.id);
+        await update("product", { id: p.id }, { $set: { basalam_photo: `${main}|${id}` } });
       } else note = " (آپلود عکس انجام نشد)";
     }
   }
@@ -106,16 +106,16 @@ export async function pushProduct(productId) {
   }
   if (!r.ok) {
     const msg = `باسلام: ${errText(r.json, r.status)}`;
-    db().prepare("UPDATE products SET basalam_error=? WHERE id=?").run(msg, p.id);
+    await update("product", { id: p.id }, { $set: { basalam_error: msg } });
     return { ok: false, message: msg };
   }
   const id = String(r.json?.id ?? r.json?.data?.id ?? raw.basalam_id ?? "");
-  db().prepare("UPDATE products SET basalam_id=COALESCE(NULLIF(?,''),basalam_id), basalam_synced_at=?, basalam_error=NULL WHERE id=?").run(id, now(), p.id);
+  await update("product", { id: p.id }, { $set: { ...(id ? { basalam_id: id } : {}), basalam_synced_at: now(), basalam_error: null } });
   return { ok: true, message: (isUpdate ? "در باسلام به‌روز شد." : "در غرفه‌ی باسلام ساخته شد.") + note };
 }
 
 export async function pushAll() {
-  const ids = db().prepare("SELECT id, title FROM products WHERE active=1 OR basalam_id IS NOT NULL").all();
+  const ids = await many("product", { $or: [{ active: 1 }, { basalam_id: { $ne: null } }] }, { projection: { id: 1, title: 1 }, sort: { id: 1 } });
   let ok = 0, fail = 0;
   const errors = [];
   for (const { id, title } of ids) {
@@ -131,7 +131,7 @@ export async function pushAll() {
 }
 
 export async function whoAmI() {
-  if (!cfg().token) return { ok: false, message: "توکن باسلام وارد نشده." };
+  if (!(await cfg()).token) return { ok: false, message: "توکن باسلام وارد نشده." };
   try {
     const r = await api("GET", "/v1/users/me");
     if (!r.ok) return { ok: false, message: errText(r.json, r.status) };

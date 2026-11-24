@@ -2,7 +2,7 @@ import { Router } from "express";
 import { getSettings } from "../settings.js";
 import { feedProducts } from "../catalog.js";
 import { siteUrl } from "../config.js";
-import { db } from "../db.js";
+import { many } from "../db.js";
 
 /**
  * فیدهای محصول برای مقایسه‌گرهای قیمت و پلتفرم‌های فروش
@@ -17,6 +17,8 @@ import { db } from "../db.js";
  * و JSON-LD در server/index.js به صفحه‌ی محصول تزریق می‌شن.
  */
 const r = Router();
+// Express 4 خطای async را خودش نمی‌گیرد
+const ah = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 function tokenOk(req, expected) {
   if (!expected) return true;
@@ -27,12 +29,12 @@ function tokenOk(req, expected) {
 const plain = (s) => String(s || "").replace(/\s+/g, " ").trim();
 
 // ---------------- ترب ----------------
-async function torob(req, res) {
-  const s = getSettings();
+const torob = ah(async (req, res) => {
+  const s = await getSettings();
   if (s.torob_enabled !== "1") return res.status(404).json({ error: "disabled" });
   if (!tokenOk(req, s.torob_token)) return res.status(401).json({ error: "invalid token" });
   const q = { ...req.query, ...(req.body || {}) };
-  let list = feedProducts();
+  let list = await feedProducts();
   // ترب می‌تونه فقط چند صفحه‌ی خاص رو بخواد
   const urls = [].concat(q.page_urls || []).filter(Boolean);
   const uniques = [].concat(q.page_uniques || []).filter(Boolean).map(String);
@@ -63,19 +65,19 @@ async function torob(req, res) {
       guarantee: p.guarantee,
     })),
   });
-}
+});
 r.get("/torob/products", torob);
 r.post("/torob/products", torob);
 
 // ---------------- ایمالز ----------------
-r.all("/emalls/products", (req, res) => {
-  const s = getSettings();
+r.all("/emalls/products", ah(async (req, res) => {
+  const s = await getSettings();
   if (s.emalls_enabled !== "1") return res.status(404).json({ success: false });
   if (!tokenOk(req, s.emalls_token)) return res.status(401).json({ success: false, message: "invalid token" });
   const q = { ...req.query, ...(req.body || {}) };
   const size = Math.min(200, Math.max(1, Number(q.item_per_page || q.size) || 100));
   const page = Math.max(1, Number(q.page) || 1);
-  const list = feedProducts();
+  const list = await feedProducts();
   res.json({
     success: true,
     total: list.length,
@@ -93,14 +95,14 @@ r.all("/emalls/products", (req, res) => {
       guarantee: p.guarantee,
     })),
   });
-});
+}));
 
 // ---------------- فید XML (گوگل و عمومی) ----------------
 const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-r.get("/feeds/products.xml", (req, res) => {
-  const s = getSettings();
+r.get("/feeds/products.xml", ah(async (req, res) => {
+  const s = await getSettings();
   if (s.google_feed_enabled !== "1") return res.status(404).end();
-  const items = feedProducts()
+  const items = (await feedProducts())
     .map((p) => `  <item>
     <g:id>${p.id}</g:id>
     <g:title>${esc(p.title)}</g:title>
@@ -127,23 +129,23 @@ r.get("/feeds/products.xml", (req, res) => {
 ${items}
 </channel>
 </rss>`);
-});
+}));
 
 // ---------------- CSV ----------------
-r.get("/feeds/products.csv", (req, res) => {
-  const s = getSettings();
+r.get("/feeds/products.csv", ah(async (req, res) => {
+  const s = await getSettings();
   if (s.google_feed_enabled !== "1") return res.status(404).end();
   const cell = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
   const head = ["شناسه", "کد کالا", "عنوان", "دسته", "عیار", "وزن (گرم)", "قیمت (تومان)", "قیمت قبل (تومان)", "موجودی", "لینک", "عکس"];
-  const rows = feedProducts().map((p) => [p.id, p.sku, p.title, p.category_name, p.karat, p.weight, p.price, p.old_price || "", p.stock, p.url, p.image_links[0] || ""]);
+  const rows = (await feedProducts()).map((p) => [p.id, p.sku, p.title, p.category_name, p.karat, p.weight, p.price, p.old_price || "", p.stock, p.url, p.image_links[0] || ""]);
   res.type("text/csv; charset=utf-8").send("﻿" + [head, ...rows].map((r) => r.map(cell).join(",")).join("\n"));
-});
+}));
 
 // ---------------- سایت‌مپ و robots ----------------
-r.get("/sitemap.xml", (req, res) => {
+r.get("/sitemap.xml", ah(async (req, res) => {
   const base = siteUrl();
-  const prods = feedProducts();
-  const cats = db().prepare("SELECT slug FROM categories WHERE active=1").all();
+  const prods = await feedProducts();
+  const cats = await many("category", { active: 1 }, { projection: { slug: 1 } });
   const urls = [
     `${base}/`, `${base}/shop`,
     ...cats.map((c) => `${base}/shop?category=${encodeURIComponent(c.slug)}`),
@@ -153,7 +155,7 @@ r.get("/sitemap.xml", (req, res) => {
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
 ${urls.map((u) => `  <url><loc>${esc(u)}</loc></url>`).join("\n")}
 </urlset>`);
-});
+}));
 r.get("/robots.txt", (req, res) => {
   res.type("text/plain").send(`User-agent: *\nDisallow: /admin\nDisallow: /api/\nDisallow: /checkout\nDisallow: /account\nSitemap: ${siteUrl()}/sitemap.xml\n`);
 });

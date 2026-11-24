@@ -1,4 +1,4 @@
-import { db, now } from "./db.js";
+import { raw, many, now } from "./db.js";
 
 /** مقادیر پیش‌فرض همه‌ی تنظیمات. همه به‌صورت رشته ذخیره می‌شن. */
 export const DEFAULTS = {
@@ -37,22 +37,33 @@ export const DEFAULTS = {
 /** کلیدهایی که هیچ‌وقت به مرورگر مشتری فرستاده نمی‌شن */
 export const SECRET_KEYS = ["zarinpal_merchant", "zibal_merchant", "torob_token", "emalls_token", "basalam_token"];
 
-export function getSettings() {
-  const rows = db().prepare("SELECT key, value FROM settings").all();
-  const s = { ...DEFAULTS };
-  for (const r of rows) s[r.key] = r.value;
-  return s;
+// تنظیمات تقریباً روی هر درخواستی خونده می‌شن؛ برای اینکه هر بار به Atlas سر نزنیم چند ثانیه کش می‌شن.
+// با هر تغییر از همین سرور، کش فوراً پاک می‌شه.
+const TTL_MS = 10_000;
+let cache = null;
+let cacheAt = 0;
+
+export async function getSettings() {
+  if (!cache || Date.now() - cacheAt > TTL_MS) {
+    const rows = await many("setting");
+    const s = { ...DEFAULTS };
+    for (const r of rows) s[r.key] = r.value;
+    cache = s;
+    cacheAt = Date.now();
+  }
+  return { ...cache };
 }
 
-export function setSettings(obj) {
-  const st = db().prepare("INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value");
-  db().transaction(() => {
-    for (const [k, v] of Object.entries(obj)) {
-      if (!(k in DEFAULTS)) continue;
-      st.run(k, String(v ?? ""));
-    }
-    if ("gold_rate_18" in obj) st.run("gold_rate_updated_at", now());
-  })();
+export async function setSettings(obj) {
+  const ops = [];
+  const put = (key, value) => ops.push({ updateOne: { filter: { t: "setting", key }, update: { $set: { value } }, upsert: true } });
+  for (const [k, v] of Object.entries(obj)) {
+    if (!(k in DEFAULTS)) continue;
+    put(k, String(v ?? ""));
+  }
+  if ("gold_rate_18" in obj) put("gold_rate_updated_at", now());
+  if (ops.length) await raw().bulkWrite(ops, { ordered: true });
+  cache = null;
 }
 
 export const num = (v, d = 0) => {

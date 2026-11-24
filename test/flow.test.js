@@ -1,19 +1,17 @@
 // تست کامل جریان: پنل، چند کاربر، محصول و عکس، خرید و پرداخت، فیدها
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "msl-"));
-process.env.DB_FILE = path.join(tmp, "test.db");
+// تست‌ها روی یک کالکشن موقت جدا در همان دیتابیس Atlas اجرا می‌شن و آخرش پاک می‌شن (به کالکشن اصلی دست نمی‌زنن).
+process.env.MONGODB_COLLECTION = `moslemi_test_${Date.now().toString(36)}`;
 process.env.ADMIN_USERNAME = "owner";
 process.env.ADMIN_PASSWORD = "owner-pass-123";
 process.env.SITE_URL = "http://localhost:4999";
 const { app } = await import("../server/index.js");
+const { dropCollection, closeDb } = await import("../server/db.js");
 let server, base;
 before(() => new Promise((r) => { server = app.listen(0, () => { base = `http://localhost:${server.address().port}`; r(); }); }));
-after(() => { server.close(); });
+after(async () => { server.close(); await dropCollection(); await closeDb(); });
 
 function client() {
   let cookie = "";
