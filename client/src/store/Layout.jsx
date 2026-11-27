@@ -61,7 +61,7 @@ export default function Layout() {
           <div className="logo" onClick={() => nav("/")} role="link" tabIndex={0} onKeyDown={(e) => e.key === "Enter" && nav("/")}>
             <LogoMark />
             <span>
-              {s.store_name || "طلا فروشی مسلمی"}
+              {s.store_name || " طلا فروشی مسلمی"}
               <em>{s.store_tagline || "طلا و جواهر اصیل"}</em>
             </span>
           </div>
